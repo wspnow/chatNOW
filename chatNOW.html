@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>chatNOW v4</title>
+<script src="https://cdn.ably.io/lib/ably.min-1.js"></script>
+<style>
+body { margin:0; font-family:sans-serif; background:#f4f4f4; height:100vh; display:flex; flex-direction:column; }
+.page { display:none; flex-direction:column; height:100vh; padding:20px; }
+#home { display:flex; justify-content:center; align-items:center; flex-direction:column; text-align:center; }
+input, button { padding:10px; margin:5px 0; border-radius:5px; border:none; }
+button { background:#0077ff; color:white; cursor:pointer; }
+#chat, #dm { display:flex; height:100vh; }
+#sidebar { width:250px; background:#2f3136; color:white; padding:10px; display:flex; flex-direction:column; }
+#main-chat { flex:1; display:flex; flex-direction:column; background:#36393f; color:white; }
+#messages { flex:1; overflow-y:auto; padding:10px; }
+.message { margin-bottom:10px; padding:10px; border-radius:8px; max-width:80%; }
+.you { background:#7289da; align-self:flex-end; color:white; }
+.other { background:#40444b; align-self:flex-start; }
+.meta { font-size:0.75em; color:#ccc; margin-bottom:5px; }
+form { display:flex; padding:10px; background:#2f3136; }
+form input { flex:1; }
+.room, .dm { padding:5px 10px; margin:5px 0; background:#40444b; border-radius:5px; cursor:pointer; }
+.active { background:#5865f2; }
+#online-users { margin-top:10px; font-size:0.9em; }
+.carousel { width:80%; height:150px; margin:20px 0; display:flex; justify-content:center; align-items:center; background:#0077ff; color:white; font-size:1.2em; border-radius:10px; }
+</style>
+</head>
+<body>
+
+<!-- Home Page -->
+<div id="home" class="page">
+  <h1>Welcome to chatNOW 🚀</h1>
+  <div class="carousel" id="carousel">Fast. Private. Cloud-backed.</div>
+  <button id="home-login-btn">Login</button>
+</div>
+
+<!-- Login Page -->
+<div id="login" class="page">
+  <h2>Login</h2>
+  <input type="text" id="login-username" placeholder="Username" required/>
+  <input type="password" id="login-password" placeholder="Password" required/>
+  <button id="login-btn">Login</button>
+  <p id="login-error" style="color:red;"></p>
+  <button id="login-back">Back</button>
+</div>
+
+<!-- Setup Page -->
+<div id="setup" class="page">
+  <h2>Create or Join a Room</h2>
+  <input type="text" id="room-name" placeholder="Room Display Name"/>
+  <button id="create-room-btn">Create Room</button>
+  <h3>Join Room by ID</h3>
+  <input type="text" id="join-room-id" placeholder="Enter Room ID"/>
+  <button id="join-room-btn">Join Room</button>
+  <h3>Your Rooms / Invites</h3>
+  <div id="joined-rooms"></div>
+</div>
+
+<!-- Chat Page -->
+<div id="chat" class="page">
+  <button id="back-to-setup">⬅ Back</button>
+  <div id="sidebar">
+    <h3>Rooms</h3>
+    <div id="room-list"></div>
+    <h3>Online Users</h3>
+    <div id="online-users"></div>
+    <h3>DM Users</h3>
+    <input type="text" id="dm-username" placeholder="Invite user to DM"/>
+    <button id="dm-invite-btn">Invite</button>
+    <div id="dm-list"></div>
+  </div>
+  <div id="main-chat">
+    <div id="messages"></div>
+    <form id="chat-form">
+      <input type="text" id="message-input" placeholder="Type a message..." required/>
+      <button type="submit">Send</button>
+    </form>
+  </div>
+</div>
+
+<script>
+const ABLY_API_KEY = 'zmHChQ.wXBXjQ:LFs7MI7PvIx4NgO2709BP-6DIJ4D_z6wS8fDustuDLQ';
+let ably, username, password, rooms=[], dms=[], currentChannel=null;
+
+// DOM refs
+const pages={home:document.getElementById('home'),login:document.getElementById('login'),setup:document.getElementById('setup'),chat:document.getElementById('chat')};
+const roomListDiv=document.getElementById('room-list');
+const messagesDiv=document.getElementById('messages');
+const onlineUsersDiv=document.getElementById('online-users');
+const joinedRoomsDiv=document.getElementById('joined-rooms');
+const carousel=document.getElementById('carousel');
+const dmListDiv=document.getElementById('dm-list');
+
+// ===== PAGE NAVIGATION =====
+function showPage(page){for(const p in pages)pages[p].style.display='none';pages[page].style.display='flex';}
+document.getElementById('home-login-btn').onclick=()=>showPage('login');
+document.getElementById('login-back').onclick=()=>showPage('home');
+document.getElementById('back-to-setup').onclick=()=>showPage('setup');
+
+// ===== HOME CAROUSEL =====
+const carouselBoxes=['Fast. Private. Cloud-backed.','Create rooms and invite friends.','Sync across any device.','Chat with DMs or groups.'];
+let carouselIndex=0;
+setInterval(()=>{
+  carouselIndex=(carouselIndex+1)%carouselBoxes.length;
+  carousel.textContent=carouselBoxes[carouselIndex];
+},3000);
+
+// ===== LOGIN =====
+document.getElementById('login-btn').onclick=()=>{
+  username=document.getElementById('login-username').value.trim();
+  password=document.getElementById('login-password').value.trim();
+  if(!username||!password){document.getElementById('login-error').textContent='Enter username and password';return;}
+  ably=new Ably.Realtime({key:ABLY_API_KEY, clientId:username});
+
+  // Subscribe to user channel for invites
+  const userChannel=ably.channels.get('user-'+username);
+  userChannel.subscribe('invite',msg=>{
+    if(msg.data.type==='dm'){
+      dms.push({id:msg.data.dmId, from:msg.data.from});
+      refreshDMs();
+    }else if(msg.data.type==='room'){
+      rooms.push({displayName:msg.data.displayName,id:msg.data.id});
+      refreshRooms();
+    }
+  });
+
+  ably.channels.get('presence-global').presence.enter({username});
+  showPage('setup');
+};
+
+// ===== SETUP =====
+document.getElementById('create-room-btn').onclick=()=>{
+  const displayName=document.getElementById('room-name').value.trim();
+  if(!displayName)return alert('Enter room display name');
+  const roomId='room-'+Math.random().toString(36).substr(2,6);
+  rooms.push({displayName,id:roomId});
+  refreshRooms();
+  document.getElementById('room-name').value='';
+};
+
+document.getElementById('join-room-btn').onclick=()=>{
+  const joinId=document.getElementById('join-room-id').value.trim();
+  if(!joinId)return alert('Enter Room ID');
+  rooms.push({displayName:joinId,id:joinId});
+  refreshRooms();
+  joinRoom({displayName:joinId,id:joinId});
+  document.getElementById('join-room-id').value='';
+};
+
+function refreshRooms(){
+  joinedRoomsDiv.innerHTML=''; roomListDiv.innerHTML='';
+  rooms.forEach(r=>{
+    const div=document.createElement('div'); div.textContent=r.displayName; div.className='room';
+    div.onclick=()=>joinRoom(r); joinedRoomsDiv.appendChild(div);
+    const sideDiv=document.createElement('div'); sideDiv.textContent=r.displayName; sideDiv.className='room';
+    sideDiv.onclick=()=>joinRoom(r); roomListDiv.appendChild(sideDiv);
+  });
+}
+
+// ===== JOIN ROOM =====
+function joinRoom(r){
+  currentChannel=ably.channels.get(r.id); showPage('chat'); messagesDiv.innerHTML='';
+  currentChannel.subscribe('chat',msg=>addMessage(msg.data.text,msg.data.username,msg.data.timestamp));
+
+  currentChannel.presence.enter({username});
+  currentChannel.presence.subscribe(presenceSet=>{
+    onlineUsersDiv.innerHTML='';
+    presenceSet.forEach(u=>{
+      const div=document.createElement('div');
+      div.textContent=(u.data && u.data.username)? u.data.username : u.clientId;
+      onlineUsersDiv.appendChild(div);
+    });
+  });
+
+  currentChannel.history({limit:50},(err,res)=>{
+    if(err) return console.error(err);
+    res.items.forEach(item=>addMessage(item.data.text,item.data.username,item.data.timestamp,true));
+  });
+}
+
+// ===== CHAT FORM =====
+document.getElementById('chat-form').addEventListener('submit',e=>{
+  e.preventDefault(); const text=document.getElementById('message-input').value.trim(); if(!text)return;
+  const msg={text,username,timestamp:Date.now()};
+  currentChannel.publish('chat',msg);
+  document.getElementById('message-input').value='';
+});
+
+// ===== ADD MESSAGE =====
+function addMessage(text,sender,timestamp){ 
+  const div=document.createElement('div'); div.classList.add('message'); div.classList.add(sender===username?'you':'other');
+  const meta=document.createElement('div'); meta.className='meta';
+  meta.textContent=`${sender} @ ${new Date(timestamp).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`;
+  div.appendChild(meta); const content=document.createElement('div'); content.textContent=text; div.appendChild(content);
+  messagesDiv.appendChild(div); messagesDiv.scrollTop=messagesDiv.scrollHeight;
+}
+
+// ===== DM SYSTEM =====
+document.getElementById('dm-invite-btn').onclick=()=>{
+  const dmUser=document.getElementById('dm-username').value.trim(); if(!dmUser)return alert('Enter username to DM');
+  const dmId='dm-'+Math.random().toString(36).substr(2,6);
+  ably.channels.get('user-'+dmUser).publish('invite',{type:'dm',from:username,dmId:dmId});
+  dms.push({id:dmId,from:dmUser}); refreshDMs(); document.getElementById('dm-username').value='';
+};
+
+function refreshDMs(){
+  dmListDiv.innerHTML='';
+  dms.forEach(d=>{
+    const div=document.createElement('div'); div.className='dm'; div.textContent=d.from;
+    div.onclick=()=>joinDM(d); dmListDiv.appendChild(div);
+  });
+}
+
+function joinDM(dm){
+  currentChannel=ably.channels.get(dm.id); showPage('chat'); messagesDiv.innerHTML='';
+  currentChannel.subscribe('chat',msg=>addMessage(msg.data.text,msg.data.username,msg.data.timestamp));
+  currentChannel.presence.enter({username});
+  currentChannel.presence.subscribe(presenceSet=>{
+    onlineUsersDiv.innerHTML='';
+    presenceSet.forEach(u=>{
+      const div=document.createElement('div');
+      div.textContent=(u.data && u.data.username)? u.data.username : u.clientId;
+      onlineUsersDiv.appendChild(div);
+    });
+  });
+  currentChannel.history({limit:50},(err,res)=>{
+    if(err) return console.error(err);
+    res.items.forEach(item=>addMessage(item.data.text,item.data.username,item.data.timestamp,true));
+  });
+}
+</script>
+</body>
+</html>
